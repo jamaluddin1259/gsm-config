@@ -1,0 +1,192 @@
+import os
+import time
+import subprocess
+import sys
+import re
+
+# ==========================================
+#          KONFIGURASI FILE & PATH
+# ==========================================
+LOG_DIR = "logs_gsm"
+BIN_TRX = "/home/jamal/osmo-trx/Transceiver52M/osmo-trx-uhd" # Path Binary TRX Mas
+
+# --- NAMA FILE CONFIG SESUAI PERMINTAAN MAS JAMAL ---
+# 1. Config USB (Jalan di Host)
+CONF_TRX_USB = "osmo-trx-uhd.cfg"
+CONF_BTS_USB = "osmo-bts-trx.cfg"
+
+# 2. Config LAN (Jalan di Namespace)
+CONF_TRX_LAN = "osmo-trx-lan.cfg"
+CONF_BTS_LAN = "osmo-bts-lan.cfg"
+
+# Config Core
+CONF_BSC = "osmo-bsc.cfg"
+CONF_MSC = "osmo-msc.cfg"
+
+# ==========================================
+#              FUNGSI BANTUAN
+# ==========================================
+def print_header(text):
+    print(f"\n\033[95m{'='*60}")
+    print(f"   {text}")
+    print(f"{'='*60}\033[0m")
+
+def print_step(message):
+    print(f"\033[92m[+] {message}\033[0m")
+
+def print_warn(message):
+    print(f"\033[93m[!] {message}\033[0m")
+
+def get_user_input(prompt, default_val):
+    user_val = input(f"   {prompt} [\033[96m{default_val}\033[0m]: ")
+    return user_val.strip() if user_val.strip() != "" else default_val
+
+def update_config(filepath, regex_pattern, new_value):
+    """Fungsi canggih untuk edit config file secara otomatis"""
+    if not os.path.exists(filepath):
+        print(f"\033[91m[ERROR] File {filepath} tidak ditemukan!\033[0m")
+        return
+    with open(filepath, 'r') as f: content = f.read()
+    # Replace regex group 1 dengan nilai baru
+    new_content, count = re.subn(regex_pattern, f"\\g<1>{new_value}", content, flags=re.MULTILINE)
+    if count > 0:
+        with open(filepath, 'w') as f: f.write(new_content)
+        # print(f"       -> Updated {filepath}")
+
+def setup_namespace():
+    """Membuat Kamar Isolasi (bts_lan) secara otomatis"""
+    print_step("Membangun Isolasi Network & NAT...")
+    cmds = [
+        # Bersihkan sisa lama
+        "ip netns del bts_lan >/dev/null 2>&1",
+        "ip link del veth-host >/dev/null 2>&1",
+        # Buat namespace
+        "ip netns add bts_lan",
+        "ip netns exec bts_lan ip link set lo up",
+        # Pasang kabel virtual
+        "ip link add veth-host type veth peer name veth-bts",
+        "ip link set veth-bts netns bts_lan",
+        # IP Host
+        "ip addr add 10.0.0.1/24 dev veth-host",
+        "ip link set veth-host up",
+        # IP Namespace
+        "ip netns exec bts_lan ip addr add 10.0.0.2/24 dev veth-bts",
+        "ip netns exec bts_lan ip link set veth-bts up",
+        # Routing & NAT
+        "ip netns exec bts_lan ip route add default via 10.0.0.1",
+        "iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -j MASQUERADE",
+        "sysctl -w net.ipv4.ip_forward=1 >/dev/null"
+    ]
+    for cmd in cmds:
+        os.system(cmd)
+
+def run_bg(command_list, log_name, use_namespace=False):
+    """Menjalankan proses di background"""
+    if not os.path.exists(LOG_DIR): os.makedirs(LOG_DIR)
+    os.system(f"chmod -R 777 {LOG_DIR}") # Wajib agar namespace bisa tulis log
+    
+    log_path = os.path.join(LOG_DIR, f"{log_name}.log")
+    
+    final_cmd = command_list
+    prefix = "[HOST]"
+    
+    if use_namespace:
+        final_cmd = ["ip", "netns", "exec", "bts_lan"] + command_list
+        prefix = "[LAN ]"
+
+    with open(log_path, "w") as f:
+        subprocess.Popen(final_cmd, stdout=f, stderr=subprocess.STDOUT)
+    
+    print(f"   -> {prefix} {log_name} berjalan...")
+
+# ==========================================
+#              MAIN PROGRAM
+# ==========================================
+def main():
+    if os.geteuid() != 0:
+        print("ERROR: Wajib pakai SUDO!")
+        sys.exit(1)
+
+    print_header("DUAL TOWER LAUNCHER (USB + LAN)")
+    
+    # --- 1. INPUT GLOBAL (PLMN) ---
+    print("\n[ KONFIGURASI GLOBAL (PLMN) ]")
+    # Karena BSC-nya satu, MCC/MNC harus sama untuk kedua tower
+    glob_mcc = get_user_input("MCC (Negara)", "510")
+    glob_mnc = get_user_input("MNC (Operator)", "10")
+
+    # --- 2. INPUT TOWER 1 (USB) ---
+    print(f"\n[ KONFIGURASI TOWER 1 (USB) -> {CONF_BTS_USB} ]")
+    usb_band  = get_user_input("BAND", "GSM900")
+    usb_arfcn = get_user_input("ARFCN", "1")
+
+    # --- 3. INPUT TOWER 2 (LAN) ---
+    print(f"\n[ KONFIGURASI TOWER 2 (LAN) -> {CONF_BTS_LAN} ]")
+    lan_band  = get_user_input("BAND", "GSM900")
+    lan_arfcn = get_user_input("ARFCN", "10") # Default beda biar aman
+
+    print_warn(f"\nSUMMARY: {glob_mcc}-{glob_mnc} | USB: Ch {usb_arfcn} | LAN: Ch {lan_arfcn}")
+    if input("   Lanjut eksekusi? [Y/n]: ").lower() == 'n': sys.exit()
+
+    # --- 4. APPLY CONFIG ---
+    print_header("1. APPLYING CONFIGURATIONS")
+    
+    # Update Core (BSC/MSC)
+    update_config(CONF_BSC, r"(^\s*network country code\s+)\d+", glob_mcc)
+    update_config(CONF_BSC, r"(^\s*mobile network code\s+)\d+", glob_mnc)
+    update_config(CONF_MSC, r"(^\s*network country code\s+)\d+", glob_mcc)
+    update_config(CONF_MSC, r"(^\s*mobile network code\s+)\d+", glob_mnc)
+
+    # Update USB Config
+    update_config(CONF_BTS_USB, r"(^\s*band\s+)[A-Z0-9]+", usb_band)
+    update_config(CONF_BTS_USB, r"(^\s*arfcn\s+)\d+", usb_arfcn)
+    
+    # Update LAN Config
+    update_config(CONF_BTS_LAN, r"(^\s*band\s+)[A-Z0-9]+", lan_band)
+    update_config(CONF_BTS_LAN, r"(^\s*arfcn\s+)\d+", lan_arfcn)
+
+    # --- 5. CLEANUP & PREPARE ---
+    print_step("Membersihkan sistem...")
+    os.system("killall -9 osmo-stp osmo-msc osmo-hlr osmo-mgw osmo-bsc osmo-trx-uhd osmo-bts-trx >/dev/null 2>&1")
+    os.system("rm -f /tmp/pcu_bts*")
+    
+    setup_namespace() # Buat kamar isolasi
+
+    # --- 6. START CORE ---
+    print_header("2. STARTING CORE NETWORK")
+    run_bg(["osmo-stp", "-c", "osmo-stp.cfg"], "core_stp")
+    time.sleep(1)
+    run_bg(["osmo-hlr", "-c", "osmo-hlr.cfg"], "core_hlr")
+    run_bg(["osmo-msc", "-c", "osmo-msc.cfg"], "core_msc")
+    run_bg(["osmo-mgw", "-c", "osmo-mgw.cfg"], "core_mgw")
+    time.sleep(2)
+    run_bg(["osmo-bsc", "-c", CONF_BSC], "core_bsc")
+    
+    print("   (Menunggu BSC stabil 5 detik...)")
+    time.sleep(5)
+
+    # --- 7. START TOWER 1 (USB - HOST) ---
+    print_header("3. STARTING TOWER 1 (USB - HOST)")
+    # Jalankan TRX USB (Host)
+    # Perhatikan: chrt -f 99 untuk prioritas tinggi
+    run_bg(["chrt", "-f", "99", BIN_TRX, "-C", CONF_TRX_USB], "trx_usb")
+    time.sleep(2)
+    # Jalankan BTS USB (Host)
+    run_bg(["osmo-bts-trx", "-c", CONF_BTS_USB], "bts_usb")
+
+    # --- 8. START TOWER 2 (LAN - NAMESPACE) ---
+    print_header("4. STARTING TOWER 2 (LAN - NAMESPACE)")
+    # Jalankan TRX LAN (Di dalam Namespace)
+    run_bg([BIN_TRX, "-C", CONF_TRX_LAN], "trx_lan", use_namespace=True)
+    time.sleep(5) # Delay agak lama untuk LAN
+    # Jalankan BTS LAN (Di dalam Namespace)
+    run_bg(["osmo-bts-trx", "-c", CONF_BTS_LAN], "bts_lan", use_namespace=True)
+
+    print_header("SYSTEM ONLINE - DUAL TOWER ACTIVE")
+    print("Pantau Log:")
+    print(f"1. USB Status : tail -f {LOG_DIR}/trx_usb.log")
+    print(f"2. LAN Status : tail -f {LOG_DIR}/trx_lan.log")
+    print(f"3. Core Status: tail -f {LOG_DIR}/core_bsc.log")
+
+if __name__ == "__main__":
+    main()
